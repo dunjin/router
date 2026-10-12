@@ -248,12 +248,18 @@ pub struct HealthConfig {
     pub timeout_secs: u64,
     /// Interval between health checks in seconds
     pub check_interval_secs: u64,
-    /// Health check endpoint path
+    /// Health check endpoint path (used by the `Http` probe)
     pub endpoint: String,
     /// Number of consecutive failures before marking unhealthy
     pub failure_threshold: u32,
     /// Number of consecutive successes before marking healthy
     pub success_threshold: u32,
+    /// Probe strategy: `Http` (GET endpoint, default) or `Generate`
+    /// (POST /v1/completions with max_tokens=1, exercises the P/D path)
+    pub probe: crate::config::HealthProbe,
+    /// Optional bearer token sent as `Authorization` on probe requests
+    /// (used when workers protect their endpoints with an API key)
+    pub api_key: Option<String>,
 }
 
 impl Default for HealthConfig {
@@ -264,6 +270,8 @@ impl Default for HealthConfig {
             endpoint: "/health".to_string(),
             failure_threshold: 3,
             success_threshold: 2,
+            probe: crate::config::HealthProbe::Http,
+            api_key: None,
         }
     }
 }
@@ -350,6 +358,25 @@ impl BasicWorker {
         self
     }
 
+    /// Access the underlying basic worker (used by DPAwareWorker for
+    /// shared health-check bookkeeping).
+    pub fn worker(&self) -> &BasicWorker {
+        self
+    }
+
+    /// Access the mutable metadata (used by tests to configure probes).
+    #[cfg(test)]
+    pub fn metadata_mut(&mut self) -> &mut WorkerMetadata {
+        &mut self.metadata
+    }
+
+    /// Test helper: start a worker in the given initial health state.
+    #[cfg(test)]
+    pub fn with_initial_health(self, healthy: bool) -> Self {
+        self.healthy.store(healthy, Ordering::Release);
+        self
+    }
+
     pub fn normalised_url(&self) -> WorkerResult<&str> {
         if self.url().contains("@") {
             // Need to extract the URL from "http://host:port@dp_rank"
@@ -369,6 +396,116 @@ impl BasicWorker {
         } else {
             Ok(self.url())
         }
+    }
+}
+
+/// Run one HTTP health probe against a worker URL, honoring the configured
+/// probe strategy, API key, and DP rank.
+///
+/// Shared by [`BasicWorker`] (no DP rank) and [`DPAwareWorker`] (pinned rank),
+/// so the probe carries the same headers a proxied user request would:
+/// `Authorization` when an API key is configured, and
+/// `X-data-parallel-rank` when the worker is a DP rank.
+///
+/// Probe requests never touch worker load counters (see PR #216).
+async fn http_health_probe(
+    url: &str,
+    cfg: &HealthConfig,
+    dp_rank: Option<usize>,
+    worker_type: &WorkerType,
+) -> bool {
+    use crate::routers::http::dp_utils::add_dp_rank_header;
+
+    let timeout = std::time::Duration::from_secs(cfg.timeout_secs);
+    match cfg.probe {
+        crate::config::HealthProbe::Http => {
+            let health_url = format!("{}{}", url, cfg.endpoint);
+            let mut req = WORKER_CLIENT.get(&health_url).timeout(timeout);
+            if let Some(rank) = dp_rank {
+                req = add_dp_rank_header(req, Some(rank));
+            }
+            match req.send().await {
+                Ok(response) => response.status().is_success(),
+                Err(_) => false,
+            }
+        }
+        crate::config::HealthProbe::Generate => {
+            // POST to the same endpoint the proxy forwards real traffic to
+            // (/v1/completions), so the probe mirrors the user-visible path.
+            let generate_url = format!("{}/v1/completions", url);
+            let mut body = serde_json::json!({
+                "prompt": "hi",
+                "max_tokens": 1,
+            });
+            // Prefill workers: attach the minimal kv_transfer_params envelope so
+            // the probe also exercises the connector-side prefill handshake.
+            // Matches the base NIXL envelope from VllmPDRouter::build_prefill_kv_transfer_params
+            // (vllm_pd_router.rs); connector-specific fields are omitted because
+            // a worker-level probe has no decode pair to target. The one-token
+            // prefill still returns quickly; connector misconfiguration will
+            // surface as a probe failure.
+            if matches!(worker_type, WorkerType::Prefill { .. }) {
+                body["kv_transfer_params"] = serde_json::json!({
+                    "do_remote_decode": true,
+                    "do_remote_prefill": false,
+                    "transfer_id": "health-probe"
+                });
+            }
+            let mut req = WORKER_CLIENT
+                .post(&generate_url)
+                .timeout(timeout)
+                .json(&body);
+            if let Some(rank) = dp_rank {
+                req = add_dp_rank_header(req, Some(rank));
+            }
+            if let Some(ref key) = cfg.api_key {
+                req = req.header("Authorization", format!("Bearer {}", key));
+            }
+            match req.send().await {
+                Ok(response) => response.status().is_success(),
+                Err(_) => false,
+            }
+        }
+    }
+}
+
+/// Apply a probe outcome to a worker's consecutive-failure / -success
+/// counters and flip health status at the configured thresholds.
+///
+/// Used by both [`BasicWorker`] and [`DPAwareWorker`] (which shares the
+/// underlying `Arc` counters with its `BasicWorker`) so the threshold
+/// logic is defined in one place.
+async fn apply_health_result(worker: &BasicWorker, ok: bool) -> WorkerResult<()> {
+    if ok {
+        // Health check succeeded
+        worker.consecutive_failures.store(0, Ordering::Release);
+        let successes = worker.consecutive_successes.fetch_add(1, Ordering::AcqRel) + 1;
+
+        // Mark healthy if we've reached the success threshold
+        if !worker.is_healthy()
+            && successes >= worker.metadata().health_config.success_threshold as usize
+        {
+            worker.set_healthy(true);
+            worker.consecutive_successes.store(0, Ordering::Release);
+        }
+        Ok(())
+    } else {
+        // Health check failed
+        worker.consecutive_successes.store(0, Ordering::Release);
+        let failures = worker.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
+
+        // Mark unhealthy if we've reached the failure threshold
+        if worker.is_healthy()
+            && failures >= worker.metadata().health_config.failure_threshold as usize
+        {
+            worker.set_healthy(false);
+            worker.consecutive_failures.store(0, Ordering::Release);
+        }
+
+        Err(WorkerError::HealthCheckFailed {
+            url: worker.url().to_string(),
+            reason: format!("Health check failed (consecutive failures: {})", failures),
+        })
     }
 }
 
@@ -402,14 +539,13 @@ impl Worker for BasicWorker {
             ConnectionMode::Http => {
                 // Perform HTTP health check
                 let url = self.normalised_url()?;
-                let health_url = format!("{}{}", url, self.metadata.health_config.endpoint);
-                let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
-
-                // Use the shared client with a custom timeout for this request
-                match WORKER_CLIENT.get(&health_url).timeout(timeout).send().await {
-                    Ok(response) => response.status().is_success(),
-                    Err(_) => false,
-                }
+                http_health_probe(
+                    url,
+                    &self.metadata.health_config,
+                    None,
+                    &self.metadata.worker_type,
+                )
+                .await
             }
             ConnectionMode::Grpc => {
                 let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
@@ -419,37 +555,7 @@ impl Worker for BasicWorker {
             }
         };
 
-        if health_result {
-            // Health check succeeded
-            self.consecutive_failures.store(0, Ordering::Release);
-            let successes = self.consecutive_successes.fetch_add(1, Ordering::AcqRel) + 1;
-
-            // Mark healthy if we've reached the success threshold
-            if !self.is_healthy()
-                && successes >= self.metadata.health_config.success_threshold as usize
-            {
-                self.set_healthy(true);
-                self.consecutive_successes.store(0, Ordering::Release);
-            }
-            Ok(())
-        } else {
-            // Health check failed
-            self.consecutive_successes.store(0, Ordering::Release);
-            let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
-
-            // Mark unhealthy if we've reached the failure threshold
-            if self.is_healthy()
-                && failures >= self.metadata.health_config.failure_threshold as usize
-            {
-                self.set_healthy(false);
-                self.consecutive_failures.store(0, Ordering::Release);
-            }
-
-            Err(WorkerError::HealthCheckFailed {
-                url: self.metadata.url.clone(),
-                reason: format!("Health check failed (consecutive failures: {})", failures),
-            })
-        }
+        apply_health_result(self, health_result).await
     }
 
     fn load(&self) -> usize {
@@ -528,6 +634,15 @@ impl DPAwareWorker {
         self.base_worker = self.base_worker.with_health_config(config);
         self
     }
+
+    /// Test helper: start a worker in the given initial health state.
+    #[cfg(test)]
+    pub fn with_initial_health(self, healthy: bool) -> Self {
+        Self {
+            base_worker: self.base_worker.with_initial_health(healthy),
+            ..self
+        }
+    }
 }
 
 #[async_trait]
@@ -553,8 +668,31 @@ impl Worker for DPAwareWorker {
     }
 
     async fn check_health_async(&self) -> WorkerResult<()> {
-        // Delegate to the base worker's health check logic
-        self.base_worker.check_health_async().await
+        use std::time::Duration;
+
+        let health_result = match &self.base_worker.metadata().connection_mode {
+            ConnectionMode::Http => {
+                let url = self.base_worker.normalised_url()?;
+                http_health_probe(
+                    url,
+                    &self.base_worker.metadata().health_config,
+                    Some(self.dp_rank),
+                    &self.base_worker.metadata().worker_type,
+                )
+                .await
+            }
+            ConnectionMode::Grpc => {
+                let timeout =
+                    Duration::from_secs(self.base_worker.metadata().health_config.timeout_secs);
+                crate::backend::check_grpc_health(self.url(), timeout)
+                    .await
+                    .is_ok()
+            }
+        };
+
+        // Share the threshold logic with BasicWorker; both drive the same
+        // underlying Arc counters on base_worker.
+        apply_health_result(&self.base_worker, health_result).await
     }
 
     fn load(&self) -> usize {
@@ -1033,6 +1171,184 @@ mod tests {
         assert_eq!(config.endpoint, "/health");
         assert_eq!(config.failure_threshold, 3);
         assert_eq!(config.success_threshold, 2);
+        assert_eq!(config.probe, crate::config::HealthProbe::Http);
+    }
+
+    /// Verify that the `Generate` probe issues `POST /v1/completions` with
+    /// `max_tokens: 1` (and never touches worker load counters).
+    #[tokio::test]
+    async fn test_health_generate_probe_hits_completions() {
+        use crate::config::HealthProbe;
+        use axum::{extract::State, routing::post, Json, Router};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc as StdArc;
+
+        /// Shared observation state for the mock completions endpoint.
+        struct ProbeObservations {
+            saw_request: StdArc<AtomicBool>,
+            got_minimal_payload: StdArc<AtomicBool>,
+        }
+        let obs = ProbeObservations {
+            saw_request: StdArc::new(AtomicBool::new(false)),
+            got_minimal_payload: StdArc::new(AtomicBool::new(false)),
+        };
+
+        async fn completions_handler(
+            State(obs): State<std::sync::Arc<ProbeObservations>>,
+            Json(payload): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            obs.saw_request.store(true, Ordering::Release);
+            let is_minimal = payload.get("max_tokens").and_then(|v| v.as_u64()) == Some(1)
+                && payload.get("prompt").and_then(|v| v.as_str()).is_some();
+            obs.got_minimal_payload.store(is_minimal, Ordering::Release);
+            Json(serde_json::json!({
+                "id": "cmpl-probe",
+                "choices": [{"text": ".", "index": 0, "finish_reason": "length"}]
+            }))
+        }
+
+        let obs_arc = StdArc::new(obs);
+        let app = Router::new()
+            .route("/v1/completions", post(completions_handler))
+            .with_state(obs_arc.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        // Give the server a moment to accept connections.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let mut worker =
+            BasicWorker::new(format!("http://127.0.0.1:{}", port), WorkerType::Regular)
+                .with_initial_health(false);
+        worker.metadata_mut().health_config.probe = HealthProbe::Generate;
+        worker.metadata_mut().health_config.endpoint = "/health".to_string();
+        // Single success is enough to observe the probe path (threshold is
+        // 2 by default, so we do not assert the healthy flip here).
+        worker.metadata_mut().health_config.success_threshold = 1;
+
+        // Before the probe the worker must have zero load.
+        assert_eq!(worker.load(), 0);
+        assert!(!worker.is_healthy(), "worker starts unhealthy");
+        assert!(worker.check_health_async().await.is_ok());
+        assert!(
+            worker.is_healthy(),
+            "probe success should flip the worker healthy with success_threshold=1"
+        );
+        // The probe must NOT have bumped the load counter.
+        assert_eq!(
+            worker.load(),
+            0,
+            "Generate health probe must not mutate worker load (see PR #216)"
+        );
+        assert!(
+            obs_arc.saw_request.load(Ordering::Acquire),
+            "Expected the probe to reach POST /v1/completions"
+        );
+        assert!(
+            obs_arc.got_minimal_payload.load(Ordering::Acquire),
+            "Expected probe body to carry max_tokens=1 and a prompt"
+        );
+    }
+
+    /// The `Generate` probe must carry the worker credential (P1: protected
+    /// workers returning 401 must not be evicted from routing) and the
+    /// `X-data-parallel-rank` header for DP-aware workers, mirroring the
+    /// headers the proxy attaches to user requests. Prefill workers must also
+    /// receive a minimal `kv_transfer_params` envelope so the connector
+    /// handshake is exercised.
+    #[tokio::test]
+    async fn test_health_generate_probe_headers_and_prefill_kv_params() {
+        use crate::config::HealthProbe;
+        use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc as StdArc;
+
+        /// Records the headers + body the mock endpoint saw.
+        struct ProbeObservations {
+            got_auth: StdArc<AtomicBool>,
+            got_dp_rank: StdArc<AtomicBool>,
+            got_prefill_kv: StdArc<AtomicBool>,
+        }
+        let obs = ProbeObservations {
+            got_auth: StdArc::new(AtomicBool::new(false)),
+            got_dp_rank: StdArc::new(AtomicBool::new(false)),
+            got_prefill_kv: StdArc::new(AtomicBool::new(false)),
+        };
+
+        async fn completions_handler(
+            State(obs): State<StdArc<ProbeObservations>>,
+            headers: HeaderMap,
+            Json(payload): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            if headers.get("Authorization").is_some() {
+                obs.got_auth.store(true, Ordering::Release);
+            }
+            if headers.get("X-data-parallel-rank").is_some() {
+                obs.got_dp_rank.store(true, Ordering::Release);
+            }
+            if payload.get("kv_transfer_params").is_some() {
+                obs.got_prefill_kv.store(true, Ordering::Release);
+            }
+            Json(serde_json::json!({
+                "id": "cmpl-probe",
+                "choices": [{"text": ".", "index": 0, "finish_reason": "length"}]
+            }))
+        }
+
+        let obs_arc = StdArc::new(obs);
+        let app = Router::new()
+            .route("/v1/completions", post(completions_handler))
+            .with_state(obs_arc.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let url = format!("http://127.0.0.1:{}", port);
+
+        // Case 1: Regular worker with an API key → Authorization must be sent.
+        let mut regular =
+            BasicWorker::new(url.clone(), WorkerType::Regular).with_initial_health(false);
+        regular.metadata_mut().health_config.probe = HealthProbe::Generate;
+        regular.metadata_mut().health_config.api_key = Some("secret-key".to_string());
+        regular.metadata_mut().health_config.success_threshold = 1;
+        assert!(regular.check_health_async().await.is_ok());
+        assert!(
+            obs_arc.got_auth.load(Ordering::Acquire),
+            "Probe must carry the configured Authorization header"
+        );
+
+        // Case 2: DP-aware prefill worker → rank header + kv_transfer_params.
+        let dp_prefill = DPAwareWorker::new(
+            url.clone(),
+            2,
+            4,
+            WorkerType::Prefill {
+                bootstrap_port: Some(9000),
+            },
+        )
+        .with_health_config(HealthConfig {
+            probe: HealthProbe::Generate,
+            ..HealthConfig::default()
+        })
+        .with_initial_health(false);
+        dp_prefill
+            .check_health_async()
+            .await
+            .expect("probe succeeds");
+        assert!(
+            obs_arc.got_dp_rank.load(Ordering::Acquire),
+            "Probe must pin the DP rank like user requests do"
+        );
+        assert!(
+            obs_arc.got_prefill_kv.load(Ordering::Acquire),
+            "Prefill probe must carry a kv_transfer_params envelope"
+        );
     }
 
     #[test]
@@ -1043,6 +1359,8 @@ mod tests {
             endpoint: "/healthz".to_string(),
             failure_threshold: 5,
             success_threshold: 3,
+            probe: crate::config::HealthProbe::Http,
+            api_key: None,
         };
         assert_eq!(config.timeout_secs, 10);
         assert_eq!(config.check_interval_secs, 60);
@@ -1082,6 +1400,8 @@ mod tests {
             endpoint: "/custom-health".to_string(),
             failure_threshold: 4,
             success_threshold: 2,
+            probe: crate::config::HealthProbe::Http,
+            api_key: None,
         };
 
         let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular)
@@ -1694,6 +2014,8 @@ mod tests {
             endpoint: "/health".to_string(),
             failure_threshold: 3,
             success_threshold: 1,
+            probe: crate::config::HealthProbe::Http,
+            api_key: None,
         };
 
         let dp_worker =

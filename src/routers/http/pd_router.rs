@@ -32,6 +32,10 @@ pub struct PdRouterBase {
     pub load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     pub client: Client,
     pub circuit_breaker_config: CircuitBreakerConfig,
+    // Health check config, shared with dynamically added (service-discovery)
+    // workers so `--health-probe` takes effect on every worker, not just
+    // the ones seeded at startup.
+    pub health_config: HealthConfig,
     // Fallback DP size for servers that report no engine metrics
     pub dp_size: usize,
 }
@@ -295,7 +299,11 @@ impl PdRouterBase {
             dp_size,
             worker_type,
             &self.circuit_breaker_config,
-            None,
+            // Discovery-added workers must keep the configured probe strategy
+            // and credential, otherwise `--health-probe generate` is silently
+            // downgraded to the default Http probe for every dynamically
+            // discovered P/D server.
+            Some(&self.health_config),
         );
 
         if workers
@@ -497,6 +505,8 @@ impl PdRouterBase {
             endpoint: ctx.router_config.health_check.endpoint.clone(),
             failure_threshold: ctx.router_config.health_check.failure_threshold,
             success_threshold: ctx.router_config.health_check.success_threshold,
+            probe: ctx.router_config.health_check.probe,
+            api_key: ctx.router_config.api_key.clone(),
         };
 
         let prefill_workers = prefill_urls.iter().map(|(url, bootstrap_port)| {
@@ -578,6 +588,7 @@ impl PdRouterBase {
             load_monitor_handle,
             client: ctx.client.clone(),
             circuit_breaker_config: core_cb_config,
+            health_config,
             dp_size: fallback_dp_size,
         })
     }
@@ -1115,6 +1126,7 @@ mod tests {
             load_monitor_handle: None,
             client: Client::new(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
+            health_config: HealthConfig::default(),
             dp_size: 1,
         }
     }
@@ -1133,6 +1145,7 @@ mod tests {
             load_monitor_handle: None,
             client: Client::new(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
+            health_config: HealthConfig::default(),
             dp_size,
         }
     }

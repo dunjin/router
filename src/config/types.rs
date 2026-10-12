@@ -772,6 +772,27 @@ fn default_retry_jitter_factor() -> f32 {
     0.2
 }
 
+/// Health check probe strategy.
+///
+/// - `Http`: `GET {endpoint}` (default). A cheap liveness check; it validates
+///   that the worker process is alive but says nothing about P/D coordination.
+/// - `Generate`: `POST /v1/completions` with a minimal prompt and
+///   `max_tokens: 1` (same endpoint the router forwards real traffic to). Exercises the full prefill→decode path (including the
+///   KV transfer for P/D pairs). Recommended for disaggregated deployments
+///   where `/health` returning 200 does not imply the P/D pipeline is usable.
+///
+/// Probe requests do not touch the worker load counters, so the periodic
+/// health checker never mutates load accounting (see PR #216).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthProbe {
+    /// Default: `GET {endpoint}`
+    #[default]
+    Http,
+    /// `POST /v1/completions` with `max_tokens: 1` (minimal inference)
+    Generate,
+}
+
 /// Health check configuration for worker monitoring
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthCheckConfig {
@@ -783,8 +804,11 @@ pub struct HealthCheckConfig {
     pub timeout_secs: u64,
     /// Interval between health checks in seconds
     pub check_interval_secs: u64,
-    /// Health check endpoint path
+    /// Health check endpoint path (used by the `Http` probe)
     pub endpoint: String,
+    /// Probe strategy: `http` (default) or `generate` (minimal inference)
+    #[serde(default)]
+    pub probe: HealthProbe,
 }
 
 impl Default for HealthCheckConfig {
@@ -795,6 +819,7 @@ impl Default for HealthCheckConfig {
             timeout_secs: 5,
             check_interval_secs: 60,
             endpoint: "/health".to_string(),
+            probe: HealthProbe::default(),
         }
     }
 }

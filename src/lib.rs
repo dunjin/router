@@ -96,6 +96,8 @@ struct Router {
     health_check_timeout_secs: u64,
     health_check_interval_secs: u64,
     health_check_endpoint: String,
+    // Health probe strategy: "http" (default) or "generate"
+    health_probe: String,
     // IGW (Inference Gateway) configuration
     enable_igw: bool,
     queue_size: usize,
@@ -232,6 +234,7 @@ impl Router {
                 timeout_secs: self.health_check_timeout_secs,
                 check_interval_secs: self.health_check_interval_secs,
                 endpoint: self.health_check_endpoint.clone(),
+                probe: self.parse_health_probe()?,
             },
             enable_igw: self.enable_igw,
             history_backend: config::HistoryBackend::Memory,
@@ -255,6 +258,21 @@ impl Router {
                 self.program_scheduling_config_json.as_deref(),
             )?,
         })
+    }
+
+    /// Parse the health probe strategy string into a `HealthProbe`.
+    fn parse_health_probe(&self) -> config::ConfigResult<config::HealthProbe> {
+        use config::{ConfigError, HealthProbe};
+        match self.health_probe.to_ascii_lowercase().as_str() {
+            "http" => Ok(HealthProbe::Http),
+            "generate" => Ok(HealthProbe::Generate),
+            other => Err(ConfigError::ValidationFailed {
+                reason: format!(
+                    "Invalid health_probe '{}': expected 'http' or 'generate'",
+                    other
+                ),
+            }),
+        }
     }
 }
 
@@ -317,6 +335,7 @@ impl Router {
         health_check_timeout_secs = 5,
         health_check_interval_secs = 60,
         health_check_endpoint = String::from("/health"),
+        health_probe = String::from("http"),
         // IGW defaults
         enable_igw = false,
         queue_size = 100,
@@ -387,6 +406,7 @@ impl Router {
         health_check_timeout_secs: u64,
         health_check_interval_secs: u64,
         health_check_endpoint: String,
+        health_probe: String,
         enable_igw: bool,
         queue_size: usize,
         queue_timeout_secs: u64,
@@ -472,6 +492,7 @@ impl Router {
             health_check_timeout_secs,
             health_check_interval_secs,
             health_check_endpoint,
+            health_probe,
             enable_igw,
             queue_size,
             queue_timeout_secs,

@@ -2,7 +2,7 @@ use clap::{ArgAction, Parser, ValueEnum};
 use std::collections::HashMap;
 use vllm_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PolicyConfig,
+    HealthCheckConfig, HealthProbe, HistoryBackend, KvConnector, MetricsConfig, PolicyConfig,
     ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
 };
 use vllm_router_rs::metrics::PrometheusConfig;
@@ -364,6 +364,11 @@ struct CliArgs {
     #[arg(long, default_value = "/health")]
     health_check_endpoint: String,
 
+    /// Health check probe strategy: "http" (GET endpoint, default) or "generate"
+    /// (POST /v1/completions with max_tokens=1 to exercise the P/D path)
+    #[arg(long, default_value = "http", value_parser = ["http", "generate"])]
+    health_probe: String,
+
     // IGW (Inference Gateway) configuration
     /// Enable Inference Gateway mode
     #[arg(long, default_value_t = false)]
@@ -602,6 +607,10 @@ impl CliArgs {
                 timeout_secs: self.health_check_timeout_secs,
                 check_interval_secs: self.health_check_interval_secs,
                 endpoint: self.health_check_endpoint.clone(),
+                probe: match self.health_probe.as_str() {
+                    "generate" => HealthProbe::Generate,
+                    _ => HealthProbe::Http,
+                },
             },
             enable_igw: self.enable_igw,
             rate_limit_tokens_per_second: None,

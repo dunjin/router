@@ -91,6 +91,10 @@ class Router:
         health_check_timeout_secs: Timeout in seconds for health check requests. Default: 5
         health_check_interval_secs: Interval in seconds between runtime health checks. Default: 60
         health_check_endpoint: Health check endpoint path. Default: '/health'
+        health_probe: Health check probe strategy. 'http' (default) does a GET
+            on the health endpoint; 'generate' POSTs a minimal inference request
+            (max_tokens=1) to /v1/completions to exercise the P/D path.
+            Default: 'http'
         enable_program_scheduling: Enable Program-level scheduling. Default: False
         program_scheduling_config_json: Optional JSON object overriding Program-level scheduling defaults.
             Requires enable_program_scheduling. Default: None

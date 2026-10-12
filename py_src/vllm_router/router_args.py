@@ -89,6 +89,7 @@ class RouterArgs:
     health_check_timeout_secs: int = 5
     health_check_interval_secs: int = 60
     health_check_endpoint: str = "/health"
+    health_probe: str = "http"
     # Circuit breaker configuration
     cb_failure_threshold: int = 10
     cb_success_threshold: int = 3
@@ -485,6 +486,18 @@ class RouterArgs:
             type=str,
             default=RouterArgs.health_check_endpoint,
             help="Health check endpoint path",
+        )
+        parser.add_argument(
+            f"--{prefix}health-probe",
+            type=str,
+            choices=["http", "generate"],
+            default=RouterArgs.health_probe,
+            help=(
+                "Health check probe strategy. 'http' (default) does GET on the "
+                "health endpoint; 'generate' POSTs a minimal inference request "
+                "(max_tokens=1) to /v1/completions to exercise the full P/D "
+                "prefill→decode path. Recommended for P/D disaggregated deployments."
+            ),
         )
         parser.add_argument(
             f"--{prefix}max-concurrent-requests",
