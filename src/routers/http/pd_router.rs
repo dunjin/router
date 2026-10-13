@@ -505,8 +505,6 @@ impl PdRouterBase {
             endpoint: ctx.router_config.health_check.endpoint.clone(),
             failure_threshold: ctx.router_config.health_check.failure_threshold,
             success_threshold: ctx.router_config.health_check.success_threshold,
-            probe: ctx.router_config.health_check.probe,
-            api_key: ctx.router_config.api_key.clone(),
         };
 
         let prefill_workers = prefill_urls.iter().map(|(url, bootstrap_port)| {

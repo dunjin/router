@@ -2,8 +2,8 @@ use clap::{ArgAction, Parser, ValueEnum};
 use std::collections::HashMap;
 use vllm_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
-    HealthCheckConfig, HealthProbe, HistoryBackend, KvConnector, MetricsConfig, PolicyConfig,
-    ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
+    HealthCheckConfig, HistoryBackend, InferenceProbeConfig, KvConnector, MetricsConfig,
+    PolicyConfig, ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
 };
 use vllm_router_rs::metrics::PrometheusConfig;
 use vllm_router_rs::server::{self, ServerConfig};
@@ -364,10 +364,20 @@ struct CliArgs {
     #[arg(long, default_value = "/health")]
     health_check_endpoint: String,
 
-    /// Health check probe strategy: "http" (GET endpoint, default) or "generate"
-    /// (POST /v1/completions with max_tokens=1 to exercise the P/D path)
-    #[arg(long, default_value = "http", value_parser = ["http", "generate"])]
-    health_probe: String,
+    /// Enable the observational one-token inference probe: periodically send a
+    /// real `max_tokens=1` completion to every worker and report the result.
+    /// The probe never marks workers unhealthy and never affects routing.
+    #[arg(long, default_value_t = false)]
+    inference_probe: bool,
+
+    /// Interval in seconds between observational inference probe sweeps
+    #[arg(long, default_value_t = 60)]
+    inference_probe_interval_secs: u64,
+
+    /// Timeout in seconds for a single observational inference probe request
+    /// (size for inference latency, not for a socket round trip)
+    #[arg(long, default_value_t = 30)]
+    inference_probe_timeout_secs: u64,
 
     // IGW (Inference Gateway) configuration
     /// Enable Inference Gateway mode
@@ -607,9 +617,10 @@ impl CliArgs {
                 timeout_secs: self.health_check_timeout_secs,
                 check_interval_secs: self.health_check_interval_secs,
                 endpoint: self.health_check_endpoint.clone(),
-                probe: match self.health_probe.as_str() {
-                    "generate" => HealthProbe::Generate,
-                    _ => HealthProbe::Http,
+                inference_probe: InferenceProbeConfig {
+                    enabled: self.inference_probe,
+                    interval_secs: self.inference_probe_interval_secs,
+                    timeout_secs: self.inference_probe_timeout_secs,
                 },
             },
             enable_igw: self.enable_igw,

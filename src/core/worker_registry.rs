@@ -436,6 +436,78 @@ impl WorkerRegistry {
 
         crate::core::HealthChecker::new(handle, shutdown)
     }
+
+    /// Start the observational inference probe.
+    ///
+    /// Sends a real one-token generation to every registered worker on each
+    /// sweep and reports the outcome through metrics and logs.
+    ///
+    /// Unlike [`Self::start_health_checker`], this task **never** mutates worker
+    /// health: it does not call `set_healthy`, does not touch the circuit
+    /// breaker, and does not change routing. It is a diagnostic, so a defect
+    /// here cannot withdraw a healthy worker from rotation. See
+    /// [`crate::core::inference_probe`].
+    pub fn start_inference_probe(
+        &self,
+        cfg: crate::config::InferenceProbeConfig,
+    ) -> crate::core::InferenceProbeHandle {
+        let workers_ref = self.workers.clone();
+        let (shutdown, handle) = crate::core::inference_probe::probe_handle();
+        let interval_secs = cfg.interval_secs.max(1);
+        let timeout_secs = cfg.timeout_secs;
+
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+
+            loop {
+                interval.tick().await;
+
+                if crate::core::inference_probe::should_stop(&shutdown) {
+                    tracing::debug!("Inference probe shutting down");
+                    break;
+                }
+
+                let workers: Vec<std::sync::Arc<dyn crate::core::Worker>> = workers_ref
+                    .iter()
+                    .map(|entry| entry.value().clone())
+                    .collect();
+
+                for worker in &workers {
+                    let outcome = crate::core::inference_probe::probe_inference(
+                        worker.as_ref(),
+                        timeout_secs,
+                    )
+                    .await;
+
+                    crate::metrics::RouterMetrics::record_inference_probe(
+                        worker.url(),
+                        outcome.ok,
+                        outcome.reason,
+                        outcome.latency_ms,
+                    );
+
+                    if outcome.ok {
+                        tracing::debug!(
+                            worker = %worker.url(),
+                            latency_ms = outcome.latency_ms,
+                            "Inference probe passed"
+                        );
+                    } else {
+                        tracing::warn!(
+                            worker = %worker.url(),
+                            reason = outcome.reason,
+                            detail = %outcome.detail,
+                            health_checker_healthy = worker.is_healthy(),
+                            "Inference probe failed: worker did not complete a one-token generation"
+                        );
+                    }
+                }
+            }
+        });
+
+        handle
+    }
 }
 
 impl Default for WorkerRegistry {

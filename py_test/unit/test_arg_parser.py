@@ -193,7 +193,9 @@ class TestRouterArgs:
             router_health_check_timeout_secs=3,
             router_health_check_interval_secs=30,
             router_health_check_endpoint="/healthz",
-            router_health_probe="generate",
+            router_inference_probe=True,
+            router_inference_probe_interval_secs=120,
+            router_inference_probe_timeout_secs=45,
         )
 
         router_args = RouterArgs.from_cli_args(args, use_router_prefix=True)
@@ -253,7 +255,9 @@ class TestRouterArgs:
         assert router_args.health_check_timeout_secs == 3
         assert router_args.health_check_interval_secs == 30
         assert router_args.health_check_endpoint == "/healthz"
-        assert router_args.health_probe == "generate"
+        assert router_args.inference_probe is True
+        assert router_args.inference_probe_interval_secs == 120
+        assert router_args.inference_probe_timeout_secs == 45
 
     def test_from_cli_args_pd_mode(self):
         """Test creating RouterArgs from CLI arguments in PD mode."""

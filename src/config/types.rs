@@ -772,25 +772,44 @@ fn default_retry_jitter_factor() -> f32 {
     0.2
 }
 
-/// Health check probe strategy.
+/// Observational inference probe configuration.
 ///
-/// - `Http`: `GET {endpoint}` (default). A cheap liveness check; it validates
-///   that the worker process is alive but says nothing about P/D coordination.
-/// - `Generate`: `POST /v1/completions` with a minimal prompt and
-///   `max_tokens: 1` (same endpoint the router forwards real traffic to). Exercises the full prefill→decode path (including the
-///   KV transfer for P/D pairs). Recommended for disaggregated deployments
-///   where `/health` returning 200 does not imply the P/D pipeline is usable.
+/// When enabled, the router periodically sends a real one-token inference
+/// request (`POST /v1/completions` with `max_tokens: 1`) to every registered
+/// worker and **reports** the result. It detects the class of failure behind
+/// [#158](https://github.com/vllm-project/router/issues/158): a worker whose
+/// process is up — and whose `/health` therefore answers 200 — but which
+/// cannot complete a generation.
 ///
-/// Probe requests do not touch the worker load counters, so the periodic
-/// health checker never mutates load accounting (see PR #216).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum HealthProbe {
-    /// Default: `GET {endpoint}`
-    #[default]
-    Http,
-    /// `POST /v1/completions` with `max_tokens: 1` (minimal inference)
-    Generate,
+/// **This probe never changes routing state.** It does not mark a worker
+/// unhealthy, does not feed the circuit breaker, and does not remove a worker
+/// from rotation; it only emits metrics and log lines. Worker health continues
+/// to be decided exclusively by the health checker and its
+/// `failure_threshold` / `success_threshold` settings. Detection and
+/// enforcement are deliberately separated: a bug here can produce a wrong
+/// report, never an outage.
+///
+/// The probe is disabled by default because it costs one real generation per
+/// worker per interval. `timeout_secs` should be sized for inference latency
+/// rather than for a socket round trip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceProbeConfig {
+    /// Whether the observational inference probe runs at all
+    pub enabled: bool,
+    /// Interval between probe sweeps in seconds
+    pub interval_secs: u64,
+    /// Timeout for a single probe request in seconds
+    pub timeout_secs: u64,
+}
+
+impl Default for InferenceProbeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: 60,
+            timeout_secs: 30,
+        }
+    }
 }
 
 /// Health check configuration for worker monitoring
@@ -804,11 +823,11 @@ pub struct HealthCheckConfig {
     pub timeout_secs: u64,
     /// Interval between health checks in seconds
     pub check_interval_secs: u64,
-    /// Health check endpoint path (used by the `Http` probe)
+    /// Health check endpoint path, fetched with `GET`
     pub endpoint: String,
-    /// Probe strategy: `http` (default) or `generate` (minimal inference)
+    /// Observational inference probe: reports, never affects routing health
     #[serde(default)]
-    pub probe: HealthProbe,
+    pub inference_probe: InferenceProbeConfig,
 }
 
 impl Default for HealthCheckConfig {
@@ -819,7 +838,7 @@ impl Default for HealthCheckConfig {
             timeout_secs: 5,
             check_interval_secs: 60,
             endpoint: "/health".to_string(),
-            probe: HealthProbe::default(),
+            inference_probe: InferenceProbeConfig::default(),
         }
     }
 }
