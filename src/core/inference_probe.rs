@@ -53,11 +53,21 @@ impl InferenceProbeOutcome {
 
 /// Probe one worker with a real one-token generation.
 ///
-/// Success requires more than a 2xx status: the worker is only reported healthy
-/// when it returns a well-formed completion choice, i.e. the inference actually
-/// produced a token. A bare status check would report success for a worker
-/// whose engine answered but produced nothing.
-pub async fn probe_inference(worker: &dyn Worker, timeout_secs: u64) -> InferenceProbeOutcome {
+/// `api_key` is the router's worker credential (`RouterConfig::api_key`, "the
+/// api key used for the authorization with the worker"). When set it is sent as
+/// `Authorization: Bearer <key>`, the same way the proxy authenticates user
+/// requests, so that protected workers are not reported as broken merely
+/// because the probe was unauthenticated.
+///
+/// Success requires more than a 2xx status: the worker is only reported as
+/// serving when it returns a well-formed completion choice, i.e. the inference
+/// actually produced a token. A bare status check would report success for a
+/// worker whose engine answered but produced nothing.
+pub async fn probe_inference(
+    worker: &dyn Worker,
+    timeout_secs: u64,
+    api_key: Option<&str>,
+) -> InferenceProbeOutcome {
     use crate::routers::http::dp_utils::add_dp_rank_header;
 
     let url = format!("{}/v1/completions", worker.base_url());
@@ -73,6 +83,9 @@ pub async fn probe_inference(worker: &dyn Worker, timeout_secs: u64) -> Inferenc
     if worker.is_dp_aware() {
         // Pin the logical rank, exactly as a proxied user request would be.
         request = add_dp_rank_header(request, worker.dp_rank());
+    }
+    if let Some(key) = api_key {
+        request = request.header("Authorization", format!("Bearer {key}"));
     }
 
     let started = Instant::now();
@@ -203,6 +216,7 @@ mod tests {
         got_minimal_payload: StdArc<AtomicBool>,
         got_dp_rank: StdArc<AtomicBool>,
         got_kv_params: StdArc<AtomicBool>,
+        auth_header: StdArc<std::sync::Mutex<Option<String>>>,
     }
 
     async fn spawn_mock(reply: Reply) -> (String, StdArc<Observations>) {
@@ -222,6 +236,9 @@ mod tests {
             }
             if payload.get("kv_transfer_params").is_some() {
                 obs.got_kv_params.store(true, Ordering::Release);
+            }
+            if let Some(value) = headers.get("Authorization") {
+                *obs.auth_header.lock().unwrap() = value.to_str().ok().map(str::to_owned);
             }
 
             match obs.reply {
@@ -249,6 +266,7 @@ mod tests {
             got_minimal_payload: StdArc::new(AtomicBool::new(false)),
             got_dp_rank: StdArc::new(AtomicBool::new(false)),
             got_kv_params: StdArc::new(AtomicBool::new(false)),
+            auth_header: StdArc::new(std::sync::Mutex::new(None)),
         });
 
         let app = Router::new()
@@ -274,7 +292,7 @@ mod tests {
         let worker = BasicWorker::new(url, WorkerType::Regular);
         assert!(worker.is_healthy(), "worker starts healthy");
 
-        let outcome = probe_inference(&worker, 5).await;
+        let outcome = probe_inference(&worker, 5, None).await;
 
         assert!(!outcome.ok, "a failing inference must be reported as such");
         assert_eq!(outcome.reason, "http_error");
@@ -300,7 +318,7 @@ mod tests {
         let worker = BasicWorker::new(url, WorkerType::Regular).with_initial_health(false);
         assert_eq!(worker.load(), 0);
 
-        let outcome = probe_inference(&worker, 5).await;
+        let outcome = probe_inference(&worker, 5, None).await;
 
         assert!(outcome.ok, "unexpected failure: {}", outcome.detail);
         assert_eq!(outcome.reason, "ok");
@@ -319,7 +337,7 @@ mod tests {
         let (url, _obs) = spawn_mock(Reply::EmptyChoices).await;
         let worker = BasicWorker::new(url, WorkerType::Regular);
 
-        let outcome = probe_inference(&worker, 5).await;
+        let outcome = probe_inference(&worker, 5, None).await;
 
         assert!(!outcome.ok);
         assert_eq!(outcome.reason, "no_choice");
@@ -340,7 +358,7 @@ mod tests {
             },
         );
 
-        let outcome = probe_inference(&worker, 5).await;
+        let outcome = probe_inference(&worker, 5, None).await;
 
         assert!(outcome.ok, "unexpected failure: {}", outcome.detail);
         assert!(
@@ -351,5 +369,30 @@ mod tests {
             !obs.got_kv_params.load(Ordering::Acquire),
             "a worker-level probe must not synthesize a P/D envelope"
         );
+    }
+
+    /// Workers behind an API key must not be reported as broken just because
+    /// the probe was unauthenticated, so the router's worker credential rides
+    /// along exactly as it does on proxied user requests.
+    #[tokio::test]
+    async fn probe_carries_the_worker_credential_when_configured() {
+        let (url, obs) = spawn_mock(Reply::Completion).await;
+        let worker = BasicWorker::new(url, WorkerType::Regular);
+
+        let outcome = probe_inference(&worker, 5, Some("secret-key")).await;
+
+        assert!(outcome.ok, "unexpected failure: {}", outcome.detail);
+        assert_eq!(
+            obs.auth_header.lock().unwrap().as_deref(),
+            Some("Bearer secret-key"),
+            "the probe must authenticate like a proxied user request"
+        );
+
+        // With no credential configured, no Authorization header is sent.
+        let (url, obs) = spawn_mock(Reply::Completion).await;
+        let worker = BasicWorker::new(url, WorkerType::Regular);
+        let outcome = probe_inference(&worker, 5, None).await;
+        assert!(outcome.ok, "unexpected failure: {}", outcome.detail);
+        assert_eq!(*obs.auth_header.lock().unwrap(), None);
     }
 }

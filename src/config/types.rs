@@ -792,6 +792,13 @@ fn default_retry_jitter_factor() -> f32 {
 /// The probe is disabled by default because it costs one real generation per
 /// worker per interval. `timeout_secs` should be sized for inference latency
 /// rather than for a socket round trip.
+///
+/// Workers are probed with `concurrency`-bounded parallelism rather than one at
+/// a time, so a sweep takes about `ceil(workers / concurrency) * timeout_secs`
+/// in the worst case, when every probe has to time out. Probing serially would
+/// make a sweep of 64 stalled workers take 32 minutes at the default timeout,
+/// leaving later workers' gauges stale precisely during the outage the probe
+/// exists to diagnose.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceProbeConfig {
     /// Whether the observational inference probe runs at all
@@ -800,6 +807,8 @@ pub struct InferenceProbeConfig {
     pub interval_secs: u64,
     /// Timeout for a single probe request in seconds
     pub timeout_secs: u64,
+    /// Maximum number of probes in flight at once within a sweep
+    pub concurrency: usize,
 }
 
 impl Default for InferenceProbeConfig {
@@ -808,6 +817,7 @@ impl Default for InferenceProbeConfig {
             enabled: false,
             interval_secs: 60,
             timeout_secs: 30,
+            concurrency: 32,
         }
     }
 }

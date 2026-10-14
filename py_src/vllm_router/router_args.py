@@ -94,6 +94,7 @@ class RouterArgs:
     inference_probe: bool = False
     inference_probe_interval_secs: int = 60
     inference_probe_timeout_secs: int = 30
+    inference_probe_concurrency: int = 32
     # Circuit breaker configuration
     cb_failure_threshold: int = 10
     cb_success_threshold: int = 3
@@ -516,6 +517,16 @@ class RouterArgs:
             help=(
                 "Timeout in seconds for a single inference probe request. Size it "
                 "for inference latency, not for a socket round trip"
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}inference-probe-concurrency",
+            type=int,
+            default=RouterArgs.inference_probe_concurrency,
+            help=(
+                "Maximum number of inference probes in flight at once. One sweep "
+                "takes about ceil(workers / concurrency) * timeout seconds in the "
+                "worst case, so raise this on large clusters"
             ),
         )
         parser.add_argument(

@@ -52,7 +52,8 @@ vllm-router \
     --worker-urls http://127.0.0.1:8000 http://127.0.0.1:8001 \
     --inference-probe \
     --inference-probe-interval-secs 60 \
-    --inference-probe-timeout-secs 30
+    --inference-probe-timeout-secs 30 \
+    --inference-probe-concurrency 32
 ```
 
 ```bash
@@ -83,6 +84,13 @@ which is what makes it safe to enable on a running cluster. Acting on a report
 — draining a node, filing a ticket — is a decision for an operator or an
 external controller consuming the metrics.
 
+### Authentication
+
+When `--api-key` (the worker authorization key) is set, probes carry it as
+`Authorization: Bearer <key>`, the same credential the proxy sends. Without it,
+workers behind an API key would reject every probe and be reported as failing
+for the wrong reason.
+
 ### Coverage
 
 The sweep iterates over **all registered workers**, so every node of the P/D
@@ -96,6 +104,14 @@ Each sweep costs one real generation per worker per interval. Size the interval
 and timeout for inference latency, not for a socket round trip: the default
 30s timeout reflects that, and a timeout tuned for a liveness probe will report
 false failures on a busy or still-loading worker.
+
+A sweep probes at most `--inference-probe-concurrency` workers at a time, so one
+sweep lasts about `ceil(workers / concurrency) * timeout` in the worst case,
+when every probe has to time out. Raise the concurrency on large fleets if a
+sweep can outlast the interval: workers are probed in fixed batches, so a single
+stalled batch delays the batches behind it and their gauges go stale. Being
+bounded also keeps a sweep from firing thousands of simultaneous generations at
+a cluster that is already struggling.
 
 ### What it cannot see
 

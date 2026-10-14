@@ -1079,7 +1079,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         Some(
             app_context
                 .worker_registry
-                .start_inference_probe(inference_cfg),
+                .start_inference_probe(inference_cfg, config.router_config.api_key.clone()),
         )
     } else {
         None

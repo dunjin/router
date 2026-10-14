@@ -379,6 +379,11 @@ struct CliArgs {
     #[arg(long, default_value_t = 30)]
     inference_probe_timeout_secs: u64,
 
+    /// Maximum number of observational inference probes in flight at once.
+    /// Bounds one sweep at about ceil(workers / concurrency) * timeout seconds.
+    #[arg(long, default_value_t = 32)]
+    inference_probe_concurrency: usize,
+
     // IGW (Inference Gateway) configuration
     /// Enable Inference Gateway mode
     #[arg(long, default_value_t = false)]
@@ -621,6 +626,7 @@ impl CliArgs {
                     enabled: self.inference_probe,
                     interval_secs: self.inference_probe_interval_secs,
                     timeout_secs: self.inference_probe_timeout_secs,
+                    concurrency: self.inference_probe_concurrency,
                 },
             },
             enable_igw: self.enable_igw,
