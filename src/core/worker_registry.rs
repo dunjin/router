@@ -477,9 +477,21 @@ impl WorkerRegistry {
                     break;
                 }
 
+                // The probe is HTTP-only (it POSTs to /v1/completions), so
+                // gRPC workers must be excluded: including them would send an
+                // HTTP request to a worker that only speaks gRPC, and every
+                // sweep would report `request_failed` + a 0 inference gauge
+                // on a perfectly healthy serving worker.
                 let workers: Vec<std::sync::Arc<dyn crate::core::Worker>> = workers_ref
                     .iter()
-                    .map(|entry| entry.value().clone())
+                    .filter_map(|entry| {
+                        let worker = entry.value();
+                        if worker.connection_mode() == ConnectionMode::Http {
+                            Some(std::sync::Arc::clone(worker))
+                        } else {
+                            None
+                        }
+                    })
                     .collect();
 
                 // Probe with bounded concurrency: at most `concurrency` requests

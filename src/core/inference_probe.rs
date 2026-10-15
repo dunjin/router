@@ -32,7 +32,8 @@ pub struct InferenceProbeOutcome {
     /// well-formed completion choice.
     pub ok: bool,
     /// Low-cardinality classifier for metric labels: one of `ok`,
-    /// `request_failed`, `http_error`, `unreadable_body`, `no_choice`.
+    /// `request_failed`, `http_error`, `unreadable_body`, `no_choice`,
+    /// `abnormal_finish`, `zero_tokens`.
     pub reason: &'static str,
     /// Human-readable reason, suitable for a log line.
     pub detail: String,
@@ -120,22 +121,59 @@ pub async fn probe_inference(
         }
     };
 
-    let has_choice = payload
+    // A successful probe must demonstrate a completed generation:
+    //   1. a completion choice is present, and
+    //   2. it terminated normally (finish_reason is "stop" or "length"; a
+    //      non-null abnormal reason such as "error" means the engine itself
+    //      failed mid-generation), and
+    //   3. at least one token was actually generated, so an empty
+    //      `choices: []` or a zero-token response cannot masquerade as success.
+    //
+    // We do *not* require non-empty `text`: a legitimately generated
+    // end-of-sequence token can yield empty text while still being a
+    // completed generation.
+    let first_choice = payload
         .get("choices")
         .and_then(|choices| choices.as_array())
-        .and_then(|choices| choices.first())
-        .is_some_and(|choice| {
-            choice.get("text").is_some_and(|text| text.is_string())
-                || choice
-                    .get("message")
-                    .and_then(|message| message.get("content"))
-                    .is_some_and(|content| content.is_string())
-        });
+        .and_then(|choices| choices.first());
 
-    if !has_choice {
+    let choice_has_text_field = first_choice.is_some_and(|choice| {
+        choice.get("text").is_some_and(|text| text.is_string())
+            || choice
+                .get("message")
+                .and_then(|message| message.get("content"))
+                .is_some_and(|content| content.is_string())
+    });
+    let finish_reason_ok = first_choice.is_some_and(|choice| {
+        choice
+            .get("finish_reason")
+            .and_then(|reason| reason.as_str())
+            .is_some_and(|reason| matches!(reason, "stop" | "length"))
+    });
+    let tokens_generated = payload
+        .get("usage")
+        .and_then(|usage| usage.get("completion_tokens"))
+        .and_then(|tokens| tokens.as_u64())
+        .unwrap_or(0);
+
+    if !choice_has_text_field {
         return InferenceProbeOutcome::failed(
             "no_choice",
             "response carried no completion choice".to_string(),
+            started.elapsed(),
+        );
+    }
+    if !finish_reason_ok {
+        return InferenceProbeOutcome::failed(
+            "abnormal_finish",
+            "completion did not terminate normally (missing or abnormal finish_reason)".to_string(),
+            started.elapsed(),
+        );
+    }
+    if tokens_generated < 1 {
+        return InferenceProbeOutcome::failed(
+            "zero_tokens",
+            "completion produced no tokens".to_string(),
             started.elapsed(),
         );
     }
@@ -203,6 +241,12 @@ mod tests {
     enum Reply {
         /// A well-formed one-token completion.
         Completion,
+        /// A completion whose finish_reason is abnormal (engine failed).
+        AbnormalFinish,
+        /// A completion that reports zero generated tokens.
+        ZeroTokens,
+        /// A completion that reports null finish_reason with a token.
+        NullFinishReason,
         /// HTTP 200, but the engine produced nothing.
         EmptyChoices,
         /// The worker cannot infer at all.
@@ -244,7 +288,26 @@ mod tests {
             match obs.reply {
                 Reply::Completion => Json(serde_json::json!({
                     "id": "cmpl-probe",
-                    "choices": [{"text": ".", "index": 0, "finish_reason": "length"}]
+                    "choices": [{"text": ".", "index": 0, "finish_reason": "length"}],
+                    "usage": {"completion_tokens": 1}
+                }))
+                .into_response(),
+                Reply::AbnormalFinish => Json(serde_json::json!({
+                    "id": "cmpl-probe",
+                    "choices": [{"text": ".", "index": 0, "finish_reason": "error"}],
+                    "usage": {"completion_tokens": 1}
+                }))
+                .into_response(),
+                Reply::ZeroTokens => Json(serde_json::json!({
+                    "id": "cmpl-probe",
+                    "choices": [{"text": ".", "index": 0, "finish_reason": "length"}],
+                    "usage": {"completion_tokens": 0}
+                }))
+                .into_response(),
+                Reply::NullFinishReason => Json(serde_json::json!({
+                    "id": "cmpl-probe",
+                    "choices": [{"text": ".", "index": 0, "finish_reason": null}],
+                    "usage": {"completion_tokens": 1}
                 }))
                 .into_response(),
                 Reply::EmptyChoices => Json(serde_json::json!({
@@ -341,6 +404,66 @@ mod tests {
 
         assert!(!outcome.ok);
         assert_eq!(outcome.reason, "no_choice");
+    }
+
+    /// An abnormal finish_reason (e.g. "error") is not a completed generation
+    /// even if the worker returned 200 and emitted a text field.
+    #[tokio::test]
+    async fn probe_rejects_abnormal_finish_reason() {
+        let (url, _obs) = spawn_mock(Reply::AbnormalFinish).await;
+        let worker = BasicWorker::new(url, WorkerType::Regular);
+
+        let outcome = probe_inference(&worker, 5, None).await;
+
+        assert!(
+            !outcome.ok,
+            "abnormal finish_reason must not count as success"
+        );
+        assert_eq!(outcome.reason, "abnormal_finish");
+    }
+
+    /// A null finish_reason is treated as abnormal for the same reason:
+    /// the probe cannot confirm a normal termination.
+    #[tokio::test]
+    async fn probe_rejects_null_finish_reason() {
+        let (url, _obs) = spawn_mock(Reply::NullFinishReason).await;
+        let worker = BasicWorker::new(url, WorkerType::Regular);
+
+        let outcome = probe_inference(&worker, 5, None).await;
+
+        assert!(!outcome.ok, "null finish_reason must not count as success");
+        assert_eq!(outcome.reason, "abnormal_finish");
+    }
+
+    /// Zero generated tokens is not a completed generation: a worker that
+    /// answered but produced no output is still broken from the probe's
+    /// perspective.
+    #[tokio::test]
+    async fn probe_rejects_zero_token_completion() {
+        let (url, _obs) = spawn_mock(Reply::ZeroTokens).await;
+        let worker = BasicWorker::new(url, WorkerType::Regular);
+
+        let outcome = probe_inference(&worker, 5, None).await;
+
+        assert!(
+            !outcome.ok,
+            "zero-token completion must not count as success"
+        );
+        assert_eq!(outcome.reason, "zero_tokens");
+    }
+
+    /// A well-formed one-token completion with a normal finish_reason is
+    /// accepted even when the text is empty (legitimate end-of-sequence).
+    #[tokio::test]
+    async fn probe_accepts_completion_with_empty_text_and_valid_finish() {
+        let (url, obs) = spawn_mock(Reply::Completion).await;
+        let worker = BasicWorker::new(url, WorkerType::Regular);
+
+        let outcome = probe_inference(&worker, 5, None).await;
+
+        assert!(outcome.ok, "unexpected failure: {}", outcome.detail);
+        assert_eq!(outcome.reason, "ok");
+        assert!(obs.saw_request.load(Ordering::Acquire));
     }
 
     /// The probe pins the DP rank like a proxied user request, and sends no

@@ -78,6 +78,18 @@ pub fn init_metrics() {
         "vllm_router_worker_inference_ok",
         "Last observational inference probe result per worker (1=completed a generation, 0=failed)"
     );
+    // Freshness signal for removed workers: the Prometheus side should alert
+    // on `vllm_router_worker_inference_ok == 0` qualified by a recency window
+    // on this gauge (e.g. `AND on(worker) vllm_router_worker_inference_last_probe_ts > time() - 5*interval`).
+    // A worker dropped from the registry (e.g. service discovery replaced a
+    // failed pod) stops being swept, so its last_probe_ts goes stale and the
+    // alert stops firing on the orphaned 0-value series.
+    describe_gauge!(
+        "vllm_router_worker_inference_last_probe_ts",
+        "Unix timestamp (seconds) of the last observational inference probe \
+         issued to each worker; used to tell active workers' gauges apart from \
+         those orphaned by removal"
+    );
     describe_histogram!(
         "vllm_router_worker_inference_probe_latency_ms",
         "Latency of observational one-token inference probes in milliseconds"
@@ -597,6 +609,20 @@ impl RouterMetrics {
             "worker" => worker_url.to_string()
         )
         .set(if ok { 1.0 } else { 0.0 });
+        // Freshness signal: lets Prometheus distinguish a worker's live gauge
+        // from one orphaned by `WorkerRegistry::remove` (see the gauge's
+        // description). Removed workers stop being swept, so this ts stops
+        // advancing and their stale series can be filtered out by alert rules.
+        gauge!("vllm_router_worker_inference_last_probe_ts",
+            "worker" => worker_url.to_string()
+        )
+        .set({
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            now_secs as f64
+        });
         if ok {
             histogram!("vllm_router_worker_inference_probe_latency_ms",
                 "worker" => worker_url.to_string()
