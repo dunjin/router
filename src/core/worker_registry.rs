@@ -133,6 +133,11 @@ impl WorkerRegistry {
             // Remove from URL mapping
             self.url_to_id.remove(worker.url());
 
+            // Expire this worker's inference-probe freshness signal: it is no
+            // longer swept (see `retire_inference_probe`), so an
+            // `inference_ok == 0` it left behind must not keep an alert firing.
+            crate::metrics::RouterMetrics::retire_inference_probe(worker.url());
+
             // Remove from model index (both ID-based and optimized)
             if let Some(mut model_workers) = self.model_workers.get_mut(worker.model_id()) {
                 model_workers.retain(|id| id != worker_id);
@@ -440,7 +445,12 @@ impl WorkerRegistry {
     /// Start the observational inference probe.
     ///
     /// Sends a real one-token generation to every registered worker on each
-    /// sweep and reports the outcome through metrics and logs.
+    /// sweep and reports the outcome through metrics and logs, **except** for
+    /// workers that have demonstrably served real traffic since the previous
+    /// sweep. Those are reported as ok-by-evidence (`result="fresh_traffic"`)
+    /// instead of being probed, so a busy cluster does not pay for a redundant
+    /// generation per worker per interval. See
+    /// [`crate::core::generation_evidence`].
     ///
     /// Unlike [`Self::start_health_checker`], this task **never** mutates worker
     /// health: it does not call `set_healthy`, does not touch the circuit
@@ -448,22 +458,38 @@ impl WorkerRegistry {
     /// here cannot withdraw a healthy worker from rotation. See
     /// [`crate::core::inference_probe`].
     ///
+    /// Only the three scheduling knobs are taken rather than a whole
+    /// [`crate::config::InferenceProbeConfig`]: the sweep never reads
+    /// `enabled` (the caller decides whether to start it at all), and taking
+    /// the fields it uses keeps the config shape from silently diverging from
+    /// the behaviour.
+    ///
     /// `api_key` is the router's worker credential; when set, probes carry it
     /// so that protected workers are not reported as failing on a 401.
     pub fn start_inference_probe(
         &self,
-        cfg: crate::config::InferenceProbeConfig,
+        interval_secs: u64,
+        timeout_secs: u64,
+        concurrency: usize,
         api_key: Option<String>,
     ) -> crate::core::InferenceProbeHandle {
         let workers_ref = self.workers.clone();
         let (shutdown, handle) = crate::core::inference_probe::probe_handle();
-        let interval_secs = cfg.interval_secs.max(1);
-        let timeout_secs = cfg.timeout_secs;
-        let concurrency = cfg.concurrency.max(1);
+        let interval_secs = interval_secs.max(1);
+        let concurrency = concurrency.max(1);
+        // Real generation evidence younger than one interval qualifies a worker
+        // for the skip. A hung stream stops producing tokens, so its evidence
+        // ages out and a later sweep probes it again.
+        let evidence_window_ms = interval_secs.saturating_mul(1000);
 
         tokio::spawn(async move {
+            let period = tokio::time::Duration::from_secs(interval_secs);
+            // `interval` fires its first tick immediately, so a bare
+            // `interval(period)` would sweep every worker at t≈0 while engines
+            // are still loading and stamp a fresh `inference_ok=0` on every
+            // rollout. Start one full period out instead.
             let mut interval =
-                tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+                tokio::time::interval_at(tokio::time::Instant::now() + period, period);
             // A sweep that overruns its interval must not queue back-to-back
             // catch-up sweeps. A missed interval is harmless for a diagnostic,
             // whereas a burst of real generations is not.
@@ -505,7 +531,27 @@ impl WorkerRegistry {
                 // outage the probe exists to diagnose.
                 let credential = api_key.as_deref();
                 for chunk in workers.chunks(concurrency) {
-                    let probes = chunk.iter().map(|worker| async move {
+                    // Workers whose real traffic already answered this sweep's
+                    // question are reported as ok-by-evidence rather than
+                    // probed. This is recorded, never silent: the gauge is set
+                    // to 1 and the freshness timestamp is refreshed exactly as
+                    // a passing probe would.
+                    let mut to_probe = Vec::with_capacity(chunk.len());
+                    for worker in chunk {
+                        if worker.has_fresh_generation_evidence(evidence_window_ms) {
+                            crate::metrics::RouterMetrics::record_inference_probe_fresh_traffic(
+                                worker.url(),
+                            );
+                            tracing::debug!(
+                                worker = %worker.url(),
+                                "Inference probe skipped: worker served a real generation within the interval"
+                            );
+                        } else {
+                            to_probe.push(std::sync::Arc::clone(worker));
+                        }
+                    }
+
+                    let probes = to_probe.iter().map(|worker| async move {
                         let outcome = crate::core::inference_probe::probe_inference(
                             worker.as_ref(),
                             timeout_secs,

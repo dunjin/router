@@ -69,7 +69,7 @@ pub async fn probe_inference(
     timeout_secs: u64,
     api_key: Option<&str>,
 ) -> InferenceProbeOutcome {
-    use crate::routers::http::dp_utils::add_dp_rank_header;
+    use crate::core::dp_headers::add_dp_rank_header;
 
     let url = format!("{}/v1/completions", worker.base_url());
     let body = serde_json::json!({
@@ -275,7 +275,10 @@ mod tests {
             {
                 obs.got_minimal_payload.store(true, Ordering::Release);
             }
-            if headers.get("X-data-parallel-rank").is_some() {
+            if headers
+                .get(crate::core::dp_headers::DP_RANK_HEADER)
+                .is_some()
+            {
                 obs.got_dp_rank.store(true, Ordering::Release);
             }
             if payload.get("kv_transfer_params").is_some() {

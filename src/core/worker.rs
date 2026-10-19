@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use futures;
 use serde_json;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 
 // Shared HTTP client for worker operations (health checks, server info, etc.)
@@ -75,6 +75,31 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     /// Get the circuit breaker for this worker
     fn circuit_breaker(&self) -> &CircuitBreaker;
+
+    /// Monotonic timestamp (milliseconds since this process started) of the last
+    /// generation this worker completed for a real proxied request, or `0` when
+    /// none has been observed.
+    ///
+    /// Used by the observational inference probe to skip a worker that is
+    /// demonstrably serving (see [`crate::core::generation_evidence`]).
+    fn last_generation_ts(&self) -> u64 {
+        0
+    }
+
+    /// Record that this worker just returned generated tokens for a real
+    /// request. This is evidence for the inference probe's skip rule; it is not
+    /// a circuit-breaker outcome, a health change, or load accounting.
+    fn note_generation_evidence(&self) {}
+
+    /// Whether this worker produced real output within the last `window_ms`.
+    ///
+    /// A hung stream or a stalled worker stops calling
+    /// [`Self::note_generation_evidence`], so its evidence ages out and the
+    /// inference probe picks it up again on a later sweep.
+    fn has_fresh_generation_evidence(&self, window_ms: u64) -> bool {
+        let last = self.last_generation_ts();
+        last != 0 && crate::core::generation_evidence::now_millis().saturating_sub(last) < window_ms
+    }
 
     /// Check if the worker is available (healthy + circuit closed/half-open)
     fn is_available(&self) -> bool {
@@ -293,6 +318,10 @@ pub struct BasicWorker {
     consecutive_failures: Arc<AtomicUsize>,
     consecutive_successes: Arc<AtomicUsize>,
     circuit_breaker: CircuitBreaker,
+    /// Monotonic timestamp (millis since process start) of the last proxied
+    /// request this worker answered with generated tokens; `0` = never seen.
+    /// Consulted by the observational inference probe, never by routing.
+    last_generation_ts: Arc<AtomicU64>,
 }
 
 impl fmt::Debug for BasicWorker {
@@ -332,6 +361,7 @@ impl BasicWorker {
             consecutive_failures: Arc::new(AtomicUsize::new(0)),
             consecutive_successes: Arc::new(AtomicUsize::new(0)),
             circuit_breaker: CircuitBreaker::new(),
+            last_generation_ts: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -348,12 +378,6 @@ impl BasicWorker {
     pub fn with_circuit_breaker_config(mut self, config: CircuitBreakerConfig) -> Self {
         self.circuit_breaker = CircuitBreaker::with_config(config);
         self
-    }
-
-    /// Access the mutable metadata (used by tests to configure probes).
-    #[cfg(test)]
-    pub fn metadata_mut(&mut self) -> &mut WorkerMetadata {
-        &mut self.metadata
     }
 
     /// Test helper: start a worker in the given initial health state.
@@ -398,7 +422,7 @@ impl BasicWorker {
 /// routing. The real-inference check that only reports lives in
 /// [`crate::core::inference_probe`] and must not be wired in here.
 async fn http_health_probe(url: &str, cfg: &HealthConfig, dp_rank: Option<usize>) -> bool {
-    use crate::routers::http::dp_utils::add_dp_rank_header;
+    use crate::core::dp_headers::add_dp_rank_header;
 
     let health_url = format!("{}{}", url, cfg.endpoint);
     let mut req = WORKER_CLIENT
@@ -474,6 +498,17 @@ impl Worker for BasicWorker {
     fn set_healthy(&self, healthy: bool) {
         self.healthy.store(healthy, Ordering::Release);
         RouterMetrics::set_worker_health(self.url(), healthy);
+    }
+
+    fn last_generation_ts(&self) -> u64 {
+        self.last_generation_ts.load(Ordering::Acquire)
+    }
+
+    fn note_generation_evidence(&self) {
+        self.last_generation_ts.store(
+            crate::core::generation_evidence::now_millis(),
+            Ordering::Release,
+        );
     }
 
     async fn check_health_async(&self) -> WorkerResult<()> {
@@ -603,6 +638,14 @@ impl Worker for DPAwareWorker {
 
     fn set_healthy(&self, healthy: bool) {
         self.base_worker.set_healthy(healthy);
+    }
+
+    fn last_generation_ts(&self) -> u64 {
+        self.base_worker.last_generation_ts()
+    }
+
+    fn note_generation_evidence(&self) {
+        self.base_worker.note_generation_evidence();
     }
 
     async fn check_health_async(&self) -> WorkerResult<()> {
@@ -1807,6 +1850,154 @@ mod tests {
         assert_eq!(dp_worker.processed_requests(), 0);
         dp_worker.increment_processed();
         assert_eq!(dp_worker.processed_requests(), 1);
+    }
+
+    /// A DP-aware worker's health check must pin the logical rank it stands for.
+    ///
+    /// Without `X-data-parallel-rank` the probe lands on whichever engine the
+    /// worker happens to pick, so one bad rank can be reported as healthy (or a
+    /// good one as failing) and the health checker flips the wrong unit. The
+    /// threshold bookkeeping that acts on the probe is asserted alongside it,
+    /// because pinning the rank must not change when health flips.
+    #[tokio::test]
+    async fn test_dp_aware_health_check_pins_rank_and_applies_thresholds() {
+        use axum::response::IntoResponse;
+        use axum::{
+            extract::State,
+            http::{HeaderMap, StatusCode},
+            routing::get,
+            Router,
+        };
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use std::sync::Arc as StdArc;
+
+        /// Sentinel for "the probe carried no rank header at all".
+        const NO_RANK: usize = usize::MAX;
+
+        struct MockHealth {
+            healthy: AtomicBool,
+            rank_header: AtomicUsize,
+            hits: AtomicUsize,
+        }
+
+        async fn health_handler(
+            State(mock): State<StdArc<MockHealth>>,
+            headers: HeaderMap,
+        ) -> axum::response::Response {
+            mock.hits.fetch_add(1, Ordering::SeqCst);
+            let rank = headers
+                .get("X-data-parallel-rank")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(NO_RANK);
+            mock.rank_header.store(rank, Ordering::SeqCst);
+
+            if mock.healthy.load(Ordering::SeqCst) {
+                StatusCode::OK.into_response()
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE.into_response()
+            }
+        }
+
+        let mock = StdArc::new(MockHealth {
+            healthy: AtomicBool::new(true),
+            rank_header: AtomicUsize::new(NO_RANK),
+            hits: AtomicUsize::new(0),
+        });
+        let app = Router::new()
+            .route("/health", get(health_handler))
+            .with_state(mock.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        const RANK: usize = 3;
+        let worker = DPAwareWorker::new(
+            format!("http://127.0.0.1:{}", port),
+            RANK,
+            4,
+            WorkerType::Regular,
+        )
+        .with_health_config(HealthConfig {
+            timeout_secs: 5,
+            check_interval_secs: 1,
+            endpoint: "/health".to_string(),
+            failure_threshold: 2,
+            success_threshold: 2,
+        });
+        assert!(worker.is_healthy(), "a worker starts healthy");
+
+        // (a) The probe reaches `/health` and carries this worker's rank.
+        assert!(worker.check_health_async().await.is_ok());
+        assert_eq!(
+            mock.rank_header.load(Ordering::SeqCst),
+            RANK,
+            "the DP-aware health probe must pin X-data-parallel-rank to its rank"
+        );
+
+        // (b) Threshold bookkeeping still flips health exactly at the
+        // configured thresholds.
+        mock.healthy.store(false, Ordering::SeqCst);
+        assert!(worker.check_health_async().await.is_err());
+        assert!(
+            worker.is_healthy(),
+            "one failure must not flip health at failure_threshold=2"
+        );
+        assert!(worker.check_health_async().await.is_err());
+        assert!(
+            !worker.is_healthy(),
+            "two consecutive failures must mark the worker unhealthy"
+        );
+
+        mock.healthy.store(true, Ordering::SeqCst);
+        assert!(worker.check_health_async().await.is_ok());
+        assert!(
+            !worker.is_healthy(),
+            "one success must not flip health at success_threshold=2"
+        );
+        assert!(worker.check_health_async().await.is_ok());
+        assert!(
+            worker.is_healthy(),
+            "two consecutive successes must mark the worker healthy again"
+        );
+        assert!(
+            mock.hits.load(Ordering::SeqCst) >= 5,
+            "every probe must reach /health"
+        );
+    }
+
+    /// The inference probe's skip rule depends on this contract: no evidence
+    /// until a real generation is noted, fresh evidence while inside the window,
+    /// and expiry once the window passes — that expiry is what lets a stalled
+    /// worker be probed again instead of being skipped forever.
+    #[tokio::test]
+    async fn test_generation_evidence_is_fresh_only_while_it_is_recent() {
+        let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular);
+
+        assert_eq!(worker.last_generation_ts(), 0, "no generation seen yet");
+        assert!(
+            !worker.has_fresh_generation_evidence(60_000),
+            "a worker that never served must not be skipped by the probe"
+        );
+
+        worker.note_generation_evidence();
+        assert!(worker.last_generation_ts() > 0);
+        assert!(
+            worker.has_fresh_generation_evidence(60_000),
+            "evidence inside the window must qualify the worker for a skip"
+        );
+        assert!(
+            !worker.has_fresh_generation_evidence(0),
+            "a zero-length window must not count anything as fresh"
+        );
+
+        // Recording again must not move the evidence clock backwards.
+        let first = worker.last_generation_ts();
+        worker.note_generation_evidence();
+        assert!(worker.last_generation_ts() >= first);
     }
 
     // ===== Tests for WorkerFactory async methods =====

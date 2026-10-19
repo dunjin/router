@@ -622,12 +622,12 @@ impl CliArgs {
                 timeout_secs: self.health_check_timeout_secs,
                 check_interval_secs: self.health_check_interval_secs,
                 endpoint: self.health_check_endpoint.clone(),
-                inference_probe: InferenceProbeConfig {
-                    enabled: self.inference_probe,
-                    interval_secs: self.inference_probe_interval_secs,
-                    timeout_secs: self.inference_probe_timeout_secs,
-                    concurrency: self.inference_probe_concurrency,
-                },
+            },
+            inference_probe: InferenceProbeConfig {
+                enabled: self.inference_probe,
+                interval_secs: self.inference_probe_interval_secs,
+                timeout_secs: self.inference_probe_timeout_secs,
+                concurrency: self.inference_probe_concurrency,
             },
             enable_igw: self.enable_igw,
             rate_limit_tokens_per_second: None,

@@ -33,8 +33,8 @@ pub struct PdRouterBase {
     pub client: Client,
     pub circuit_breaker_config: CircuitBreakerConfig,
     // Health check config, shared with dynamically added (service-discovery)
-    // workers so `--health-probe` takes effect on every worker, not just
-    // the ones seeded at startup.
+    // workers so `--health-check-endpoint` and the failure/success thresholds
+    // take effect on every worker, not just the ones seeded at startup.
     pub health_config: HealthConfig,
     // Fallback DP size for servers that report no engine metrics
     pub dp_size: usize,
@@ -299,10 +299,12 @@ impl PdRouterBase {
             dp_size,
             worker_type,
             &self.circuit_breaker_config,
-            // Discovery-added workers must keep the configured probe strategy
-            // and credential, otherwise `--health-probe generate` is silently
-            // downgraded to the default Http probe for every dynamically
-            // discovered P/D server.
+            // Discovery-added workers must inherit the configured health
+            // check rather than fall back to the defaults, otherwise
+            // `--health-check-endpoint` and the failure/success thresholds
+            // apply only to the statically configured P/D servers and every
+            // dynamically discovered server is probed with a different
+            // endpoint and different thresholds.
             Some(&self.health_config),
         );
 

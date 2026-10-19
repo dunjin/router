@@ -13,7 +13,6 @@ mod common;
 
 use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig};
 use std::sync::Arc;
-use vllm_router_rs::config::InferenceProbeConfig;
 use vllm_router_rs::core::inference_probe::probe_inference;
 use vllm_router_rs::core::{BasicWorker, Worker, WorkerRegistry, WorkerType};
 
@@ -101,15 +100,7 @@ async fn periodic_sweep_never_mutates_worker_health() {
     let registry = WorkerRegistry::new();
     registry.register(worker.clone() as Arc<dyn Worker>);
 
-    let handle = registry.start_inference_probe(
-        InferenceProbeConfig {
-            enabled: true,
-            interval_secs: 1,
-            timeout_secs: 5,
-            concurrency: 32,
-        },
-        None,
-    );
+    let handle = registry.start_inference_probe(1, 5, 32, None);
 
     // Let at least one sweep run, twice over, to catch a mutating probe.
     tokio::time::sleep(tokio::time::Duration::from_millis(2500)).await;
@@ -178,15 +169,7 @@ async fn periodic_sweep_probes_with_bounded_concurrency() {
         )) as Arc<dyn Worker>);
     }
 
-    let handle = registry.start_inference_probe(
-        InferenceProbeConfig {
-            enabled: true,
-            interval_secs: 1,
-            timeout_secs: 5,
-            concurrency: CONCURRENCY,
-        },
-        None,
-    );
+    let handle = registry.start_inference_probe(1, 5, CONCURRENCY, None);
 
     tokio::time::sleep(tokio::time::Duration::from_millis(2500)).await;
     handle.stop();

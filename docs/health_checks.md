@@ -62,6 +62,20 @@ vllm-router --inference-probe ...
 python -m vllm_router.launch_router --inference-probe ...
 ```
 
+In the YAML config the probe is a **top-level** key, a sibling of
+`health_check` rather than a child of it:
+
+```yaml
+inference_probe:
+  enabled: true
+  interval_secs: 60
+  timeout_secs: 30
+  concurrency: 32
+```
+
+The placement is deliberate: the probe never affects worker health, so it must
+not be reachable through a health key.
+
 The request is `POST {worker}/v1/completions` with
 `{"prompt": "hi", "max_tokens": 1}` — the same endpoint the router forwards user
 traffic to. A worker is reported as serving only when it **completes the
@@ -93,10 +107,12 @@ for the wrong reason.
 
 ### Coverage
 
-The sweep iterates over **all registered workers**, so every node of the P/D
-topology is probed, including nodes that never receive traffic. This is
-deliberately different from the router-level `GET /health_generate` endpoint,
-which samples a single P/D pair per call.
+The sweep iterates over **all registered HTTP workers**, so every node of the
+P/D topology is covered, including nodes that never receive traffic. Workers
+currently being verified by their own real traffic are skipped rather than
+probed (see *Continuous traffic* below), and gRPC workers are excluded (see
+*Other modes*). This is deliberately different from the router-level
+`GET /health_generate` endpoint, which samples a single P/D pair per call.
 
 ### Cost and tuning
 
@@ -112,6 +128,54 @@ sweep can outlast the interval: workers are probed in fixed batches, so a single
 stalled batch delays the batches behind it and their gauges go stale. Being
 bounded also keeps a sweep from firing thousands of simultaneous generations at
 a cluster that is already struggling.
+
+The first sweep happens one full interval after startup, not immediately, so a
+rollout does not stamp `inference_ok = 0` on workers that are still loading.
+
+### Continuous traffic: a worker may be skipped
+
+A worker that has demonstrably served a real proxied generation within the last
+interval already answered the probe's question, so the sweep **skips** it
+instead of spending another real one-token generation on it. Under continuous
+traffic the same busy workers can therefore go many intervals without ever being
+probed, which is intended, not a gap.
+
+A skip is reported, never silent: the sweep increments
+`vllm_router_worker_inference_probe_total{result="fresh_traffic"}`, sets
+`vllm_router_worker_inference_ok` to `1`, and refreshes
+`vllm_router_worker_inference_last_probe_ts` exactly as a passing probe would.
+The `fresh_traffic` label is what keeps "skipped because it is serving" apart
+from "probed and passed" (`result="ok"`), so a dashboard can show how much of
+the fleet is being verified by real traffic rather than by the probe.
+
+Skipping is self-healing. Evidence is only credited for a response that
+actually carries generated tokens (the same bar a passing probe uses: a non-empty
+choice or a positive `completion_tokens`, never a bare 2xx). A worker that stops
+generating — a hung stream, a stalled engine — stops being credited, its
+evidence ages out within one interval, and the next sweep probes it again.
+
+### Prefill-role workers
+
+The sweep covers every registered worker, including P/D **prefill**-role
+instances, because a prefill instance is a full vLLM engine and the failure
+class in #158 is engine-local. A healthy prefill instance is expected to serve
+the standalone one-token completion and be reported `ok`.
+
+The standalone request deliberately carries **no `kv_transfer_params`**. In a
+real P/D pair that envelope is built from the *decode* peer's coordinates, and
+for the Mooncake connector it also writes the connector's `transfer_id`
+bookkeeping on the prefill side. Sending the envelope from a worker-level probe
+would overwrite that bookkeeping with an id no decode peer is waiting on, and
+would reserve KV blocks that are never released by a decode handshake. A probe
+is not a P/D pair, so it must not impersonate one.
+
+The consequence is that a prefill-role instance which cannot serve a standalone
+one-token completion is reported as **failing**, even though it may still be
+able to serve prefill on a real paired request. Read a failing prefill worker as
+"this engine cannot complete a generation on its own" — an engine-level defect
+worth investigating — rather than as proof that paired P/D traffic is broken.
+Conversely, a passing prefill worker does not prove the paired
+prefill→decode path works: see *What it cannot see* below.
 
 ### What it cannot see
 
@@ -131,19 +195,24 @@ Verifying a full paired P/D path is separate work.
 
 | Metric | Meaning |
 |---|---|
-| `vllm_router_worker_inference_probe_total{worker,result}` | probe outcomes; `result` is `ok`, `request_failed`, `http_error`, `unreadable_body`, or `no_choice` |
-| `vllm_router_worker_inference_ok{worker}` | last sweep's result (`1` served, `0` failed) |
+| `vllm_router_worker_inference_probe_total{worker,result}` | probe outcomes; `result` is `ok`, `fresh_traffic`, `request_failed`, `http_error`, `unreadable_body`, `no_choice`, `abnormal_finish`, or `zero_tokens` |
+| `vllm_router_worker_inference_ok{worker}` | last sweep's result (`1` served or was skipped as `fresh_traffic`, `0` failed) |
 | `vllm_router_worker_inference_probe_latency_ms{worker}` | latency of successful probes |
+| `vllm_router_worker_inference_last_probe_ts{worker}` | Unix seconds of the last probe — or, for a skipped sweep, of the real generation that qualified it. `0` once the worker is removed from the registry |
 
-`vllm_router_worker_inference_ok` is the metric to alert on: it is `0` exactly
-for the workers that are up, that the health checker considers healthy, and that
-cannot serve. Failures also log a warning naming the worker, the classifier, the
-error detail, and whether the health checker currently considers the worker
-healthy — which makes "healthy but cannot infer" immediately greppable.
+`vllm_router_worker_inference_ok` is the metric to alert on, qualified by the
+recency of `vllm_router_worker_inference_last_probe_ts` so a series orphaned by
+worker removal cannot keep firing: it is `0` exactly for the workers that are
+up, that the health checker considers healthy, and that cannot serve. Failures
+also log a warning naming the worker, the classifier, the error detail, and
+whether the health checker currently considers the worker healthy — which makes
+"healthy but cannot infer" immediately greppable.
 
 ### Other modes
 
-- gRPC workers (`grpc://`) use the gRPC health service; the inference probe is
-  an HTTP-worker feature.
+- gRPC workers (`grpc://`) are excluded from the sweep by design: the probe is
+  HTTP-only (it POSTs to `/v1/completions`), so probing a gRPC-only worker would
+  report `request_failed` and pin `inference_ok = 0` on a healthy serving
+  worker. gRPC workers keep using the gRPC health service.
 - `--health-check-endpoint` is unrelated to the inference probe and does not
   affect it.
