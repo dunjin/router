@@ -69,7 +69,8 @@ const MAX_SCAN_BYTES: usize = 64 * 1024;
 /// accepts a response when it carries a non-empty `choices` array plus either
 ///
 /// * `usage.completion_tokens` present and `>= 1`, or
-/// * a non-empty `text` / `content` string in the first choice,
+/// * a non-empty `text` / `content` string in the first choice **and no
+///   `completion_tokens` field at all**,
 ///
 /// and, for a body with no `choices` key at all (a bare usage document), when
 /// `usage.completion_tokens` is present and `>= 1`.
@@ -80,14 +81,38 @@ const MAX_SCAN_BYTES: usize = 64 * 1024;
 /// a failure even alongside a positive token count: that is exactly the shape
 /// of the usage-only terminal chunk of an SSE stream, and of the probe's own
 /// `no_choice` outcome, neither of which is a completed generation on its own.
+/// An **explicit** `completion_tokens: 0` is equally authoritative: it vetoes
+/// the text fallback, because `probe_inference` classifies exactly that body
+/// (`text: "."`, `finish_reason: "length"`, `completion_tokens: 0`) as
+/// `zero_tokens`. Counting it as evidence would let a worker that never
+/// generates tokens keep its sweep skipped and its `inference_ok` pinned to 1
+/// for as long as it keeps answering.
 pub fn body_shows_generated_tokens(body: &[u8]) -> bool {
     let body = &body[..body.len().min(MAX_SCAN_BYTES)];
-    if choices_present(body) {
-        choices_is_non_empty(body)
-            && (completion_tokens_at_least_one(body) || choice_carries_text(body))
-    } else {
-        completion_tokens_at_least_one(body)
+    let tokens = completion_tokens_state(body);
+    if !choices_present(body) {
+        // A bare usage document is only evidence when it reports generation.
+        return tokens == TokenCount::AtLeastOne;
     }
+    if !choices_is_non_empty(body) {
+        return false;
+    }
+    match tokens {
+        TokenCount::AtLeastOne => true,
+        TokenCount::Zero => false,
+        TokenCount::Absent => choice_carries_text(body),
+    }
+}
+
+/// How a body reports the number of tokens the worker generated.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TokenCount {
+    /// No `usage.completion_tokens` field is present at all.
+    Absent,
+    /// The field is present and reports zero, or is present but unreadable.
+    Zero,
+    /// The field reports at least one token.
+    AtLeastOne,
 }
 
 /// Whether the body has a `"choices"` key at all, regardless of its value.
@@ -95,32 +120,46 @@ fn choices_present(body: &[u8]) -> bool {
     find(body, b"\"choices\"", 0).is_some()
 }
 
-/// `"completion_tokens"` followed by a number `>= 1`, tolerating arbitrary
-/// whitespace around the separator (serde_json may be pretty-printed).
-fn completion_tokens_at_least_one(body: &[u8]) -> bool {
+/// Classify the `completion_tokens` field, tolerating arbitrary whitespace
+/// around the separator (serde_json may be pretty-printed).
+///
+/// Every occurrence is inspected: a positive count anywhere wins, otherwise a
+/// present field is [`TokenCount::Zero`]. A field that is present but does not
+/// hold a number (a string, `null`) counts as zero — it is not a count this
+/// scan can trust, and treating it as absent would let the text fallback accept
+/// a body whose token count is unreadable.
+fn completion_tokens_state(body: &[u8]) -> TokenCount {
     const KEY: &[u8] = b"\"completion_tokens\"";
+    let mut saw_field = false;
     let mut search_from = 0;
     while let Some(offset) = find(body, KEY, search_from) {
-        let mut index = skip_whitespace(body, offset + KEY.len());
-        if body.get(index) == Some(&b':') {
-            index = skip_whitespace(body, index + 1);
-            let digits_start = index;
-            while index < body.len() && body[index].is_ascii_digit() {
-                index += 1;
-            }
-            if index > digits_start {
-                let value = body[digits_start..index].iter().fold(0u64, |acc, digit| {
-                    acc.saturating_mul(10)
-                        .saturating_add(u64::from(digit - b'0'))
-                });
-                if value >= 1 {
-                    return true;
-                }
-            }
-        }
         search_from = offset + KEY.len();
+        let mut index = skip_whitespace(body, search_from);
+        if body.get(index) != Some(&b':') {
+            continue;
+        }
+        saw_field = true;
+        index = skip_whitespace(body, index + 1);
+        let digits_start = index;
+        while index < body.len() && body[index].is_ascii_digit() {
+            index += 1;
+        }
+        if index == digits_start {
+            continue;
+        }
+        let value = body[digits_start..index].iter().fold(0u64, |acc, digit| {
+            acc.saturating_mul(10)
+                .saturating_add(u64::from(digit - b'0'))
+        });
+        if value >= 1 {
+            return TokenCount::AtLeastOne;
+        }
     }
-    false
+    if saw_field {
+        TokenCount::Zero
+    } else {
+        TokenCount::Absent
+    }
 }
 
 /// A non-empty `"choices"` array whose first object carries a non-empty `"text"`
@@ -246,6 +285,25 @@ mod tests {
     fn rejects_zero_tokens() {
         let body = br#"{"choices":[{"text":"","index":0,"finish_reason":"length"}],"usage":{"completion_tokens":0}}"#;
         assert!(!body_shows_generated_tokens(body));
+    }
+
+    #[test]
+    fn rejects_an_explicit_zero_even_when_a_choice_carries_text() {
+        // The probe tests' `Reply::ZeroTokens` fixture: a non-empty text with
+        // `completion_tokens: 0`. `probe_inference` classifies this body as
+        // `zero_tokens`, so it must not count as evidence either -- otherwise a
+        // worker that never generates tokens could keep its sweep skipped and
+        // `inference_ok` pinned to 1 for as long as it keeps answering.
+        let body = br#"{"choices":[{"text":".","finish_reason":"length"}],"usage":{"completion_tokens":0}}"#;
+        assert!(!body_shows_generated_tokens(body));
+    }
+
+    #[test]
+    fn accepts_text_only_when_the_token_count_is_absent() {
+        // Same shape with the usage field removed: no count to veto, so the
+        // text fallback applies (a streamed chunk, or a worker that omits usage).
+        let body = br#"{"choices":[{"text":".","finish_reason":"length"}]}"#;
+        assert!(body_shows_generated_tokens(body));
     }
 
     #[test]

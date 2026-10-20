@@ -23,7 +23,7 @@ pub const DP_RANK_HEADER: &str = "X-data-parallel-rank";
 /// use vllm_router_rs::core::dp_headers::add_dp_rank_header;
 ///
 /// let client = reqwest::Client::new();
-/// let request = client.post("http://worker:8000/v1/generate");
+/// let request = client.post("https://worker:8000/v1/generate");
 /// let request = add_dp_rank_header(request, Some(3));
 /// // Request now has "X-data-parallel-rank: 3" header
 /// ```
@@ -52,12 +52,12 @@ mod tests {
     fn add_dp_rank_header_pins_a_rank_and_leaves_none_untouched() {
         let client = reqwest::Client::new();
 
-        let request = add_dp_rank_header(client.post("http://worker:8000"), Some(3))
+        let request = add_dp_rank_header(client.post("https://worker:8000"), Some(3))
             .build()
             .expect("request builds");
         assert_eq!(request.headers().get(DP_RANK_HEADER).unwrap(), "3");
 
-        let request = add_dp_rank_header(client.post("http://worker:8000"), None)
+        let request = add_dp_rank_header(client.post("https://worker:8000"), None)
             .build()
             .expect("request builds");
         assert!(request.headers().get(DP_RANK_HEADER).is_none());
