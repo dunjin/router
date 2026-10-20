@@ -82,6 +82,7 @@ once_cell = "1.21.3"
 zmq = "0.10.0"
 lru = { version = "0.18", default-features = false }
 rmp-serde = "1.3"
+rmpv = { version = "1.3", features = ["with-serde"] }
 wasmtime = { version = "36", default-features = false, features = [
     "component-model",
     "cranelift",
@@ -104,6 +105,7 @@ vllm-tokenizer = { git = "https://github.com/vllm-project/vllm", tag = "v0.29.0"
 vllm-text = { git = "https://github.com/vllm-project/vllm", tag = "v0.29.0" }
 
 [dev-dependencies]
+libc = "0.2"
 criterion = { version = "0.5", features = ["html_reports"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
